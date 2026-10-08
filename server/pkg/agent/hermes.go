@@ -490,9 +490,12 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		b.cfg.Logger.Debug("hermes ignoring ExecOptions.SystemPrompt; using cwd-scoped context files", "cwd", opts.Cwd)
 	}
 
-	env := buildEnv(b.cfg.Env)
-	// Enable yolo mode so Hermes auto-approves all tool executions.
-	env = append(env, "HERMES_YOLO_MODE=1")
+	// Yolo mode is opt-in per agent: only HERMES_YOLO_MODE in the agent's own
+	// custom_env (b.cfg.Env) turns it on. A value inherited from the daemon's
+	// process environment is dropped so it cannot silently enable yolo for
+	// every agent on the runtime. See hermesYoloOptIn.
+	yolo := hermesYoloOptIn(b.cfg.Env)
+	env := hermesChildEnv(b.cfg.Env, yolo)
 	cmd.Env = env
 
 	stdout, err := cmd.StdoutPipe()
@@ -571,6 +574,12 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		pending:                    make(map[int]*pendingRPC),
 		pendingTools:               make(map[string]*pendingToolCall),
 		toolStartCarriesFinalInput: b.cfg.BuiltinRuntime,
+		// Without the per-agent yolo opt-in, the real Hermes Agent asks
+		// before every dangerous command. A headless daemon cannot ask a
+		// human, so those prompts fail closed. Scoped to the built-in
+		// runtime like toolStartCarriesFinalInput: jcode shares this
+		// backend but has its own permission semantics.
+		selectPermission: hermesPermissionSelector(b.cfg.BuiltinRuntime, yolo, b.cfg.Logger),
 		acceptNotification: func(string) bool {
 			return streamingCurrentTurn.Load()
 		},
@@ -1295,7 +1304,8 @@ func (c *hermesClient) handleLine(line string) {
 	// Agent → client request: has id + method (no result / error yet).
 	// Kimi and Hermes both use session/request_permission; if we don't
 	// answer, the agent blocks for its internal timeout and the task
-	// hangs. HERMES_YOLO_MODE=1 only suppresses Hermes' dangerous-shell-
+	// hangs. HERMES_YOLO_MODE (opt-in per agent, see hermesYoloOptIn) only
+	// suppresses Hermes' dangerous-shell-
 	// command prompts (tools/approval.py); its ACP edit-approval guard
 	// (acp_adapter/edit_approval.py) still asks before every file write,
 	// so we must handle these requests for Hermes too.
@@ -1601,6 +1611,103 @@ func isACPGrantKind(kind string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// hermesYoloEnvKey is the Hermes switch that skips its dangerous-command
+// approval prompts (tools/approval.py). Multica used to force it on for every
+// Hermes task; it is now opt-in per agent through the agent's custom_env.
+const hermesYoloEnvKey = "HERMES_YOLO_MODE"
+
+// hermesTruthyValues matches Hermes' utils.TRUTHY_STRINGS, so the daemon and
+// Hermes agree on whether a given value turns yolo on.
+var hermesTruthyValues = map[string]struct{}{"1": {}, "true": {}, "yes": {}, "on": {}}
+
+// hermesYoloOptIn reports whether the agent explicitly opted in to Hermes yolo
+// mode. agentEnv is the per-task env the daemon assembled (task context plus
+// the agent's custom_env); the daemon's own process environment is NOT
+// consulted, so a stray HERMES_YOLO_MODE on the daemon host cannot enable yolo
+// for every agent on the runtime.
+func hermesYoloOptIn(agentEnv map[string]string) bool {
+	v, ok := agentEnv[hermesYoloEnvKey]
+	if !ok {
+		return false
+	}
+	_, truthy := hermesTruthyValues[strings.ToLower(strings.TrimSpace(v))]
+	return truthy
+}
+
+// hermesChildEnv builds the Hermes child env. With the opt-in it pins
+// HERMES_YOLO_MODE=1 (the pre-opt-in behaviour); without it every
+// HERMES_YOLO_MODE entry — inherited from the daemon or set to a falsy value
+// in custom_env — is removed, so Hermes keeps its approval prompts.
+func hermesChildEnv(agentEnv map[string]string, yolo bool) []string {
+	base := buildEnv(agentEnv)
+	env := make([]string, 0, len(base)+1)
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == hermesYoloEnvKey {
+			continue
+		}
+		env = append(env, entry)
+	}
+	if yolo {
+		env = append(env, hermesYoloEnvKey+"=1")
+	}
+	return env
+}
+
+// acpToolKindEdit is the ACP ToolKind Hermes puts on its file-edit approval
+// requests (acp_adapter/edit_approval.py build_acp_edit_tool_call). Its
+// dangerous-command approvals use kind "execute" (acp_adapter/permissions.py).
+const acpToolKindEdit = "edit"
+
+// hermesPermissionSelector returns the permission policy for a Hermes task, or
+// nil to keep the shared ACP policy (selectACPPermissionOption).
+//
+// The guarded policy applies to the real Hermes Agent (builtin runtime) when
+// the agent has not opted in to yolo. Hermes then sends a
+// session/request_permission before every command its approval layer flags as
+// dangerous. Nobody is present to approve it, so the daemon denies it — the
+// same fail-closed behaviour Hermes has in its own unattended modes:
+//
+//   - kind "edit" (Hermes' per-write edit approval): unchanged, a single-use
+//     grant via selectACPPermissionOption. Hermes Kanban workers write files
+//     without prompts, so denying these would make every task unusable without
+//     adding safety;
+//   - every other kind, including "execute" and a missing or unknown kind:
+//     select the offered reject_once, or return ok=false (a protocol error,
+//     which Hermes maps to deny) when none is offered. Never a grant.
+func hermesPermissionSelector(builtinRuntime, yolo bool, logger *slog.Logger) func(json.RawMessage) (string, bool, bool) {
+	if !builtinRuntime || yolo {
+		return nil
+	}
+	return func(params json.RawMessage) (string, bool, bool) {
+		var p struct {
+			ToolCall struct {
+				Kind  string `json:"kind"`
+				Title string `json:"title"`
+			} `json:"toolCall"`
+			Options []acpPermissionOption `json:"options"`
+		}
+		if len(params) > 0 {
+			if err := json.Unmarshal(params, &p); err != nil {
+				return "", false, false
+			}
+		}
+		if strings.EqualFold(strings.TrimSpace(p.ToolCall.Kind), acpToolKindEdit) {
+			return selectACPPermissionOption(params)
+		}
+		if logger != nil {
+			logger.Warn("hermes: denied permission request (yolo mode off for this agent)",
+				"tool_kind", p.ToolCall.Kind, "title", p.ToolCall.Title)
+		}
+		for _, opt := range p.Options {
+			if opt.OptionID != "" && strings.EqualFold(strings.TrimSpace(opt.Kind), acpKindRejectOnce) {
+				return opt.OptionID, false, true
+			}
+		}
+		return "", false, false
 	}
 }
 

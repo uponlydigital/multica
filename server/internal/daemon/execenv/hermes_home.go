@@ -103,6 +103,7 @@ var hermesOverriddenEntries = map[string]struct{}{
 	"active_profile":           {},
 	"profiles":                 {},
 	".env":                     {},
+	hermesInstallsEntry:        {},
 	hermesTaskLocalStateMarker: {},
 }
 
@@ -448,6 +449,12 @@ func writeDerivedHermesEnv(sharedHome, hermesHome string) error {
 		}
 	} else {
 		body = stripDotenvAssignment(src, "HERMES_HOME")
+		// Hermes yolo mode is opt-in per agent through the agent's custom_env
+		// only (see agent.hermesYoloOptIn). Hermes loads this file with
+		// override=True, so a HERMES_YOLO_MODE line in the source profile's
+		// .env would otherwise switch approval prompts off for every agent
+		// that uses the profile.
+		body = stripDotenvAssignment(body, "HERMES_YOLO_MODE")
 	}
 
 	var buf strings.Builder

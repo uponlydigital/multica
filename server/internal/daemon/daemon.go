@@ -7992,6 +7992,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	var hermesEnv map[string]string
 	var hermesMemoryStore string
 	var hermesSessionStore string
+	var hermesInstallsStore string
 	if provider == "hermes" {
 		// Resolve from the argv hermes will actually parse — launch prefix,
 		// the filtered custom args, then `acp` — which agent.HermesLaunchArgv
@@ -8035,6 +8036,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			d.markActiveStore(store)
 			defer d.unmarkActiveStore(store)
 		}
+		// One Hermes dependency store per resolved source home, shared by all
+		// of its tasks, so the ~390 MB Python environment is built once rather
+		// than inside every task's overlay. Not GC'd. See hermes_installs.go.
+		hermesInstallsStore = execenv.HermesInstallsStorePath(d.cfg.Profile, res.SourceHome)
 		// The overlay links state.db here so the conversation transcript
 		// survives the task and a follow-up turn can actually resume it
 		// (GH #6806). Keyed on (agent, resolved source home, conversation):
@@ -8104,6 +8109,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			HermesEnv:             hermesEnv,
 			HermesMemoryStore:     hermesMemoryStore,
 			HermesSessionStore:    hermesSessionStore,
+			HermesInstallsStore:   hermesInstallsStore,
 			ReasonixEnv:           reasonixEnv,
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
@@ -8154,6 +8160,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			HermesEnv:             hermesEnv,
 			HermesMemoryStore:     hermesMemoryStore,
 			HermesSessionStore:    hermesSessionStore,
+			HermesInstallsStore:   hermesInstallsStore,
 			ReasonixEnv:           reasonixEnv,
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
