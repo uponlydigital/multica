@@ -137,6 +137,8 @@ export interface WorkspaceSystemWakeup {
   builtin_instruction: string;
   /** Open issues whose rule a person changed; they ignore this default. */
   customized: number;
+  /** Sub-issues in In Review count as delivered (off by default). */
+  count_in_review: boolean;
 }
 
 export type WakeupPreview = Pick<

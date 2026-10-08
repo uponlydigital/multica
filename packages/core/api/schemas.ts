@@ -3654,6 +3654,7 @@ export const SystemWakeupSchema = z.object({
 export const WorkspaceSystemWakeupSchema = z.object({
   rule: z.literal("child_done"), enabled: z.boolean().default(true), instruction: z.string().default(""),
   builtin_instruction: z.string().default(""), customized: z.number().int().nonnegative().default(0),
+  count_in_review: z.boolean().default(false),
 });
 
 export const IssueWakeupSummaryRowSchema = IssueWakeupSchema.pick({
