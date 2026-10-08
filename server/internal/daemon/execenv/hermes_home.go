@@ -103,6 +103,7 @@ var hermesOverriddenEntries = map[string]struct{}{
 	"active_profile":           {},
 	"profiles":                 {},
 	".env":                     {},
+	hermesInstallsEntry:        {},
 	hermesTaskLocalStateMarker: {},
 }
 
@@ -448,6 +449,12 @@ func writeDerivedHermesEnv(sharedHome, hermesHome string) error {
 		}
 	} else {
 		body = stripDotenvAssignment(src, "HERMES_HOME")
+		// Hermes yolo mode is opt-in per agent through the agent's custom_env
+		// only (see agent.hermesYoloOptIn). Hermes loads this file with
+		// override=True, so a HERMES_YOLO_MODE line in the source profile's
+		// .env would otherwise switch approval prompts off for every agent
+		// that uses the profile.
+		body = stripDotenvAssignment(body, "HERMES_YOLO_MODE")
 	}
 
 	var buf strings.Builder
@@ -495,7 +502,13 @@ func dotenvLineKey(line string) string {
 	if eq <= 0 {
 		return ""
 	}
-	return strings.TrimSpace(s[:eq])
+	key := strings.TrimSpace(s[:eq])
+	// python-dotenv (what Hermes loads .env with) also accepts a quoted key:
+	// 'KEY'=v or "KEY"=v assigns KEY.
+	if len(key) >= 2 && (key[0] == '\'' || key[0] == '"') && key[len(key)-1] == key[0] {
+		key = strings.TrimSpace(key[1 : len(key)-1])
+	}
+	return key
 }
 
 // mirrorSharedHermesHome symlinks every top-level entry of the shared ~/.hermes/

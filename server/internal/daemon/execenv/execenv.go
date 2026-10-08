@@ -108,6 +108,11 @@ type PrepareParams struct {
 	// state.db task-local — no agent or conversation to key on, or the Multica
 	// profile dir could not be resolved.
 	HermesSessionStore string
+	// HermesInstallsStore is the shared Hermes dependency store
+	// (HermesInstallsStorePath) the overlay links installs/ to, so a profile's
+	// Python environment is built once instead of once per task. Empty keeps
+	// Hermes' task-local build.
+	HermesInstallsStore string
 	// HermesEnv is the sanitized effective env (agent custom_env minus the daemon
 	// blocklisted keys) used to expand ${VAR} in Hermes external_dirs so it
 	// matches what the Hermes child process actually sees. Only used for hermes.
@@ -665,6 +670,7 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 			return nil, fmt.Errorf("execenv: prepare hermes-home: %w", err)
 		}
 		env.HermesHome = hermesHome
+		linkHermesInstalls(hermesHome, params.HermesSourceHome, params.HermesInstallsStore, logger)
 		if sessions.Mounted {
 			env.HermesSessionStore = params.HermesSessionStore
 			env.HermesSessionHistoryPresent = sessions.HistoryPresent
@@ -790,6 +796,7 @@ type ReuseParams struct {
 	HermesEnv             map[string]string
 	HermesMemoryStore     string
 	HermesSessionStore    string
+	HermesInstallsStore   string
 	// ReasonixEnv mirrors PrepareParams.ReasonixEnv on reuse so the rewritten
 	// reasonix.toml keeps restating the owner's current permissions.
 	ReasonixEnv map[string]string
@@ -977,6 +984,7 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 				return nil
 			}
 			env.HermesHome = hermesHome
+			linkHermesInstalls(hermesHome, params.HermesSourceHome, params.HermesInstallsStore, logger)
 			env.HermesSessionStore = ""
 			env.HermesSessionHistoryPresent = false
 			if sessions.Mounted {
