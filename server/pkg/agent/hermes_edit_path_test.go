@@ -133,6 +133,10 @@ func TestHermesEditPathPolicyReviewBypasses(t *testing.T) {
 			"*** Begin Patch\n*** Update File: a.txt\n@@\n-x\n+y\n*** Copy File: a.txt\n*** End Patch"), false},
 		{"V4A CRLF, all inside", hermesV4AEdit(t, "a.txt",
 			"*** Begin Patch\r\n***Update File: a.txt\r\n@@\r\n-x\r\n+y\r\n*** End Patch\r\n"), true},
+		{"V4A vertical tab after ***, inside", hermesV4AEdit(t, "a.txt",
+			"*** Begin Patch\n***\vAdd File: a.txt\n+z\n*** End Patch"), true},
+		{"V4A vertical tab after ***, outside", hermesV4AEdit(t, "a.txt",
+			"*** Begin Patch\n*** Update File: a.txt\n@@\n-x\n+y\n***\vAdd File: "+filepath.Join(outsideDir, "x")+"\n+z\n*** End Patch"), false},
 		// 2. ".." out of a missing dir must not hide a later symlink.
 		{"missing/../symlink escape (absolute)", hermesWriteFileEdit(t, abs("missing/../escape/new.txt")), false},
 		{"missing/../symlink escape (relative)", hermesWriteFileEdit(t, "missing/../escape/new.txt"), false},

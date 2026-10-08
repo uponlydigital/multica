@@ -1739,7 +1739,7 @@ func hermesRejectOnce(options []acpPermissionOption) (string, bool, bool) {
 // the whole patch unreadable to the daemon and the edit is denied, so a
 // marker spelling this list misses fails closed instead of slipping a target
 // past the check.
-const hermesPyWS = `[\s\p{Z}\x{1c}-\x{1f}\x{85}]`
+const hermesPyWS = `[\s\x0b\p{Z}\x{1c}-\x{1f}\x{85}]`
 
 var (
 	hermesV4AFileRe     = regexp.MustCompile(`^\*\*\*` + hermesPyWS + `*(?:Update|Add|Delete)` + hermesPyWS + `+File:` + hermesPyWS + `*(.+)`)
