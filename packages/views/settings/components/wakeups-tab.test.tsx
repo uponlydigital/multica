@@ -32,7 +32,7 @@ function mount() {
 beforeEach(() => {
   role = "admin";
   list.mockReset().mockResolvedValue([
-    { rule: "child_done", enabled: true, instruction: "", builtin_instruction: "Advance the next stage.", customized: 2 },
+    { rule: "child_done", enabled: true, instruction: "", builtin_instruction: "Advance the next stage.", customized: 2, count_in_review: false },
   ]);
   update.mockReset().mockResolvedValue(undefined);
 });

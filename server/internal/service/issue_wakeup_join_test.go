@@ -152,7 +152,7 @@ func TestTurnedOffChildDoneRuleLeavesARequeuedRun(t *testing.T) {
 				if _, err := s.UpdateChildDoneRule(ctx, issue, SystemWakeupInput{Enabled: &off}); err != nil {
 					t.Fatal(err)
 				}
-			} else if _, err := s.SetChildDoneDefault(ctx, parseTestUUID(t, f.WorkspaceID), &off, nil); err != nil {
+			} else if _, err := s.SetChildDoneDefault(ctx, parseTestUUID(t, f.WorkspaceID), &off, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			if notes := wakeClaim(t, f, s, waiting); notes != "" {

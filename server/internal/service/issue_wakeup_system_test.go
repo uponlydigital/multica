@@ -88,3 +88,29 @@ func TestChildDoneInstructionPrecedence(t *testing.T) {
 		t.Fatal("unreadable settings must keep the rule on")
 	}
 }
+
+func TestChildDoneCountsInReviewSetting(t *testing.T) {
+	for raw, want := range map[string]bool{
+		`{}`: false, `not json`: false, `{"system_wakeup_child_done_in_review":false}`: false,
+		`{"system_wakeup_child_done_in_review":"true"}`: false, `{"system_wakeup_child_done_in_review":true}`: true,
+	} {
+		if got := ChildDoneCountsInReview([]byte(raw)); got != want {
+			t.Errorf("ChildDoneCountsInReview(%s) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
+// Sub-issues counted as delivered in review close their stage and are named
+// in the woken agent's facts.
+func TestStageProgressReportsInReview(t *testing.T) {
+	review := sub(1, true, false)
+	review.InReview = true
+	met, fingerprint, observed := stageProgress([]subIssue{review, sub(1, true, false), sub(2, false, false)})
+	stages := observed["stages"].([]stageCount)
+	if !met || fingerprint != "stage:1" || observed["in_review"] != 1 || stages[0] != (stageCount{Stage: 1, Total: 2, Closed: 2, InReview: 1}) {
+		t.Fatalf("stageProgress = %v %q %+v", met, fingerprint, observed)
+	}
+	if _, _, observed = stageProgress([]subIssue{sub(0, true, false)}); observed["in_review"] != nil {
+		t.Fatalf("in_review reported without sub-issues in review: %+v", observed)
+	}
+}

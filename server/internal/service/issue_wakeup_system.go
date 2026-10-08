@@ -36,6 +36,11 @@ const (
 	// the rule's workspace default. Only an explicit false turns it off.
 	WorkspaceSettingChildDone            = "system_wakeup_child_done"
 	WorkspaceSettingChildDoneInstruction = "system_wakeup_child_done_instruction"
+	// WorkspaceSettingChildDoneInReview makes the rule count a sub-issue in
+	// In Review as delivered, for workspaces where agents finish at In Review
+	// and done stays human. Only an explicit true turns it on. The sub-issue
+	// event trigger reads the same key (migration 565).
+	WorkspaceSettingChildDoneInReview = "system_wakeup_child_done_in_review"
 	// childChangeHint prompts an evaluation after sub-issues changed. Like
 	// other hints it never becomes a run input.
 	childChangeHint = "children.changed"
@@ -63,6 +68,25 @@ func SystemWakeupDefault(settings []byte) (bool, string) {
 	return string(values[WorkspaceSettingChildDone]) != "false", strings.TrimSpace(instruction)
 }
 
+// ChildDoneCountsInReview reports whether the workspace counts sub-issues in
+// In Review as delivered for the rule. Off unless set to true.
+func ChildDoneCountsInReview(settings []byte) bool {
+	var values map[string]json.RawMessage
+	if json.Unmarshal(settings, &values) != nil {
+		return false
+	}
+	return string(values[WorkspaceSettingChildDoneInReview]) == "true"
+}
+
+// childDoneInReview reads the setting for the rule's workspace.
+func childDoneInReview(ctx context.Context, q *db.Queries, workspaceID pgtype.UUID) (bool, error) {
+	ws, err := q.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return false, err
+	}
+	return ChildDoneCountsInReview(ws.Settings), nil
+}
+
 // ChildDoneInstruction is the instruction the rule's runs receive.
 func ChildDoneInstruction(issueInstruction string, settings []byte) string {
 	if s := strings.TrimSpace(issueInstruction); s != "" {
@@ -79,7 +103,11 @@ func systemRuleText(rule string) pgtype.Text { return pgtype.Text{String: rule, 
 // baselineChildDone records what already holds for a rule that was just
 // turned on, so facts that became true while it was off do not wake anyone.
 func baselineChildDone(ctx context.Context, tx pgx.Tx, q *db.Queries, rule db.IssueWakeup) error {
-	children, err := loadSubIssues(ctx, tx, q, rule.IssueID, rule.WorkspaceID)
+	inReview, err := childDoneInReview(ctx, q, rule.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	children, err := loadSubIssues(ctx, tx, q, rule.IssueID, rule.WorkspaceID, inReview)
 	if err != nil {
 		return err
 	}
@@ -104,7 +132,7 @@ func EnsureChildDoneRule(ctx context.Context, tx pgx.Tx, q *db.Queries, parent d
 		return rule, err
 	}
 	enabled, _ := SystemWakeupDefault(ws.Settings)
-	children, err := loadSubIssues(ctx, tx, q, parent.ID, parent.WorkspaceID)
+	children, err := loadSubIssues(ctx, tx, q, parent.ID, parent.WorkspaceID, ChildDoneCountsInReview(ws.Settings))
 	if err != nil {
 		return rule, err
 	}
@@ -703,6 +731,9 @@ func (s *IssueWakeupService) publishSystemInbox(item db.InboxItem, issueStatus s
 type SystemWakeupInput struct {
 	Enabled     *bool   `json:"enabled"`
 	Instruction *string `json:"instruction"`
+	// CountInReview is workspace-only: count sub-issues in In Review as
+	// delivered. A per-issue update rejects it.
+	CountInReview *bool `json:"count_in_review,omitempty"`
 }
 
 // UpdateChildDoneRule applies a person's change on one issue. From then on
@@ -726,6 +757,9 @@ func (s *IssueWakeupService) UpdateChildDoneRule(ctx context.Context, issueID pg
 	}
 	if rule, err = q.LockIssueWakeup(ctx, rule.ID); err != nil {
 		return out, err
+	}
+	if in.CountInReview != nil {
+		return out, fmt.Errorf("%w: count_in_review is a workspace setting", ErrWakeupInput)
 	}
 	enabled, instruction := rule.Enabled, rule.Instruction
 	if in.Enabled != nil {
@@ -765,8 +799,15 @@ func (s *IssueWakeupService) UpdateChildDoneRule(ctx context.Context, issueID pg
 
 // SetChildDoneDefault stores the rule's workspace default and applies it to
 // every rule nobody customized. It returns how many rules changed.
-func (s *IssueWakeupService) SetChildDoneDefault(ctx context.Context, workspaceID pgtype.UUID, enabled *bool, instruction *string) (int64, error) {
+//
+// countInReview sets whether sub-issues in In Review count as delivered. It
+// changes no rule's recorded state: a parent whose sub-issues already all sit
+// in In Review is woken at its next sub-issue change, not by the switch.
+func (s *IssueWakeupService) SetChildDoneDefault(ctx context.Context, workspaceID pgtype.UUID, enabled *bool, instruction *string, countInReview *bool) (int64, error) {
 	patch := map[string]any{}
+	if countInReview != nil {
+		patch[WorkspaceSettingChildDoneInReview] = *countInReview
+	}
 	if enabled != nil {
 		patch[WorkspaceSettingChildDone] = *enabled
 	}

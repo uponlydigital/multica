@@ -254,6 +254,8 @@ type workspaceSystemWakeupResponse struct {
 	// Customized counts open issues whose rule a person changed; they no
 	// longer follow this default.
 	Customized int64 `json:"customized"`
+	// CountInReview: sub-issues in In Review count as delivered.
+	CountInReview bool `json:"count_in_review"`
 }
 
 func (h *Handler) workspaceSystemWakeups(r *http.Request, workspaceID pgtype.UUID) ([]workspaceSystemWakeupResponse, error) {
@@ -269,6 +271,7 @@ func (h *Handler) workspaceSystemWakeups(r *http.Request, workspaceID pgtype.UUI
 	return []workspaceSystemWakeupResponse{{
 		Rule: service.SystemRuleChildDone, Enabled: enabled, Instruction: instruction,
 		BuiltinInstruction: service.ChildDoneDefaultInstruction, Customized: customized,
+		CountInReview: service.ChildDoneCountsInReview(ws.Settings),
 	}}, nil
 }
 
@@ -309,7 +312,7 @@ func (h *Handler) UpdateWorkspaceSystemWakeup(w http.ResponseWriter, r *http.Req
 		writeError(w, 403, "only owners and admins can change workspace defaults")
 		return
 	}
-	if _, err := (&service.IssueWakeupService{Tasks: h.TaskService}).SetChildDoneDefault(r.Context(), parseUUID(workspaceID), in.Enabled, in.Instruction); err != nil {
+	if _, err := (&service.IssueWakeupService{Tasks: h.TaskService}).SetChildDoneDefault(r.Context(), parseUUID(workspaceID), in.Enabled, in.Instruction, in.CountInReview); err != nil {
 		if errors.Is(err, service.ErrWakeupInput) {
 			writeError(w, 400, err.Error())
 			return

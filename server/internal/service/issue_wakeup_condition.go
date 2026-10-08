@@ -237,7 +237,14 @@ func evaluateCondition(ctx context.Context, tx pgx.Tx, q *db.Queries, w db.Issue
 			return bytes.Equal(value, canonicalWakeupPayload(c.Value)), "property:" + string(value), map[string]any{"property_id": c.PropertyID, "value": json.RawMessage(value)}, nil
 		}
 	case "children_done":
-		children, err := loadSubIssues(ctx, tx, q, w.IssueID, w.WorkspaceID)
+		inReview := false
+		if w.SystemRule.Valid && w.SystemRule.String == SystemRuleChildDone {
+			var err error
+			if inReview, err = childDoneInReview(ctx, q, w.WorkspaceID); err != nil {
+				return false, "", nil, err
+			}
+		}
+		children, err := loadSubIssues(ctx, tx, q, w.IssueID, w.WorkspaceID, inReview)
 		if err != nil {
 			return false, "", nil, err
 		}
@@ -406,15 +413,20 @@ func baselineCondition(ctx context.Context, tx pgx.Tx, q *db.Queries, w db.Issue
 
 // subIssue is one sub-issue as the children_done condition reads it. Closed
 // covers the done and closed status categories; Cancelled is closed without
-// finishing.
+// finishing. InReview is an In Review sub-issue counted as delivered (and so
+// Closed), which only the child_done rule does, when its workspace says so.
 type subIssue struct {
 	ID        pgtype.UUID
 	Stage     pgtype.Int4
 	Closed    bool
 	Cancelled bool
+	InReview  bool
 }
 
-func loadSubIssues(ctx context.Context, tx pgx.Tx, q *db.Queries, parent, workspace pgtype.UUID) ([]subIssue, error) {
+// loadSubIssues reads the parent's sub-issues. inReviewDelivered counts a
+// sub-issue in In Review as closed (the child_done rule, when the workspace's
+// system_wakeup_child_done_in_review setting is on).
+func loadSubIssues(ctx context.Context, tx pgx.Tx, q *db.Queries, parent, workspace pgtype.UUID, inReviewDelivered bool) ([]subIssue, error) {
 	rows, err := tx.Query(ctx, "SELECT id,status,stage FROM issue WHERE parent_issue_id=$1 AND workspace_id=$2 ORDER BY id", parent, workspace)
 	if err != nil {
 		return nil, err
@@ -446,6 +458,9 @@ func loadSubIssues(ctx context.Context, tx pgx.Tx, q *db.Queries, parent, worksp
 		}
 		children[i].Closed = category == "done" || category == "closed"
 		children[i].Cancelled = category == "closed"
+		if inReviewDelivered && status == issuestatus.InReview {
+			children[i].Closed, children[i].InReview = true, true
+		}
 	}
 	return children, nil
 }
@@ -479,6 +494,8 @@ type stageCount struct {
 	Total     int   `json:"total"`
 	Closed    int   `json:"closed"`
 	Cancelled int   `json:"cancelled"`
+	// InReview counts closed sub-issues that are delivered but in review.
+	InReview int `json:"in_review,omitempty"`
 }
 
 // stageProgress is the system rule's reading. It holds when a stage and every
@@ -490,7 +507,7 @@ func stageProgress(children []subIssue) (bool, string, map[string]any) {
 	counts := map[int32]*stageCount{}
 	var stages []int32
 	unstaged := stageCount{}
-	closed, cancelled := 0, 0
+	closed, cancelled, inReview := 0, 0, 0
 	for _, ch := range children {
 		sc := &unstaged
 		if ch.Stage.Valid {
@@ -508,6 +525,10 @@ func stageProgress(children []subIssue) (bool, string, map[string]any) {
 		if ch.Cancelled {
 			sc.Cancelled++
 			cancelled++
+		}
+		if ch.InReview {
+			sc.InReview++
+			inReview++
 		}
 	}
 	slices.Sort(stages)
@@ -529,6 +550,9 @@ func stageProgress(children []subIssue) (bool, string, map[string]any) {
 	observed := map[string]any{"total": len(children), "closed": closed, "cancelled": cancelled, "stages": list}
 	if unstaged.Total > 0 {
 		observed["unstaged"] = unstaged
+	}
+	if inReview > 0 {
+		observed["in_review"] = inReview
 	}
 	switch {
 	case len(children) > 0 && closed == len(children):

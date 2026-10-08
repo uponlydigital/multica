@@ -108,6 +108,8 @@ Larger work can be split into sub-issues: the parent issue keeps the overall goa
 
 Sub-issues can be given a **stage** to advance in batches — 1, 2, 3. When every sub-issue in the earliest unfinished stage reaches `done` or `cancelled`, the parent issue receives a "sub-issues completed" notification; when the parent's assignee is an agent, it wakes up and decides whether to start the next stage. Sub-issues without a stage count as one batch and notify once when they all finish.
 
+If agents in your workspace finish their work at `in_review` and `done` stays a human decision, a workspace owner or admin can make the rule count `in_review` as finished: `PUT /api/system-wakeups/child_done` with `{"count_in_review": true}`. The parent's agent is then woken when the last sub-issue reaches `in_review`; moving reviewed sub-issues on to `done` does not wake it again. Conditions you set yourself with `--until-children-done` still wait for `done` or `cancelled`.
+
 ## Switch views
 
 The Issues page offers five views — list, board, table, Gantt, and swimlane — filterable and sortable by status, assignee, project, and other properties. They all show the same issues.

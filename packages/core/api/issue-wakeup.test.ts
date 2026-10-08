@@ -205,7 +205,7 @@ it("reads a member target and a pause, and drops an unknown target", async () =>
 it("reads workspace defaults and rejects a malformed list", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify([{ rule: "child_done", enabled: false, customized: 2 }]))));
   await expect(client.listWorkspaceSystemWakeups()).resolves.toEqual([
-    { rule: "child_done", enabled: false, instruction: "", builtin_instruction: "", customized: 2 },
+    { rule: "child_done", enabled: false, instruction: "", builtin_instruction: "", customized: 2, count_in_review: false },
   ]);
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify([{ rule: "other" }]))));
   await expect(client.listWorkspaceSystemWakeups()).rejects.toThrow("Could not load system wakeups");
