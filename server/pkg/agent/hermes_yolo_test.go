@@ -66,13 +66,13 @@ func TestHermesChildEnvYolo(t *testing.T) {
 
 func TestHermesPermissionSelectorScope(t *testing.T) {
 	t.Parallel()
-	if hermesPermissionSelector(true, true, nil) != nil {
+	if hermesPermissionSelector(true, true, "", nil) != nil {
 		t.Error("yolo opt-in must keep the shared ACP policy (nil selector)")
 	}
-	if hermesPermissionSelector(false, false, nil) != nil {
+	if hermesPermissionSelector(false, false, "", nil) != nil {
 		t.Error("non-builtin hermes-family runtimes (jcode) must keep the shared ACP policy")
 	}
-	if hermesPermissionSelector(true, false, nil) == nil {
+	if hermesPermissionSelector(true, false, "", nil) == nil {
 		t.Error("builtin Hermes without yolo must get the guarded selector")
 	}
 }
@@ -81,8 +81,13 @@ func TestHermesPermissionSelectorScope(t *testing.T) {
 // for a dangerous-command approval (acp_adapter/permissions.py).
 const hermesCommandApprovalOptions = `[{"optionId":"allow_once","kind":"allow_once","name":"Allow once"},{"optionId":"allow_session","kind":"allow_always","name":"Allow for session"},{"optionId":"allow_always","kind":"allow_always","name":"Allow always"},{"optionId":"deny","kind":"reject_once","name":"Deny"},{"optionId":"deny_always","kind":"reject_always","name":"Deny always"}]`
 
+// hermesEditApprovalOptions is the option list Hermes' ACP edit approval sends
+// (acp_adapter/edit_approval.py make_acp_edit_approval_requester).
+const hermesEditApprovalOptions = `[{"optionId":"allow_once","kind":"allow_once","name":"Allow edit"},{"optionId":"deny","kind":"reject_once","name":"Deny"}]`
+
 func TestHermesGuardedPermissionReplies(t *testing.T) {
 	t.Parallel()
+	workdir := t.TempDir()
 	cases := []struct {
 		name     string
 		toolCall string
@@ -121,10 +126,23 @@ func TestHermesGuardedPermissionReplies(t *testing.T) {
 			wantErr:  true,
 		},
 		{
-			name:     "file edit approval keeps the single-use grant",
-			toolCall: `{"toolCallId":"edit-approval-1","title":"Approve edit: reply.md","kind":"edit","status":"pending"}`,
-			options:  `[{"optionId":"allow_once","kind":"allow_once","name":"Allow edit"},{"optionId":"deny","kind":"reject_once","name":"Deny"}]`,
+			name:     "file edit inside the workdir keeps the single-use grant",
+			toolCall: `{"toolCallId":"edit-approval-1","title":"Approve edit: reply.md","kind":"edit","status":"pending","content":[{"type":"diff","path":"reply.md","oldText":null,"newText":"x"}],"rawInput":{"tool":"write_file","arguments":{"path":"reply.md","content":"x"}}}`,
+			options:  hermesEditApprovalOptions,
 			wantID:   "allow_once",
+		},
+		{
+			// LAB-152 / gate P24: write_file outside the workdir used to be granted.
+			name:     "file edit outside the workdir is denied",
+			toolCall: `{"toolCallId":"edit-approval-2","title":"Approve edit: /tmp/x-written.txt","kind":"edit","status":"pending","content":[{"type":"diff","path":"/tmp/x-written.txt","newText":"probe"}],"rawInput":{"tool":"write_file","arguments":{"path":"/tmp/x-written.txt","content":"probe"}}}`,
+			options:  hermesEditApprovalOptions,
+			wantID:   "deny",
+		},
+		{
+			name:     "file edit without any target path is denied",
+			toolCall: `{"toolCallId":"edit-approval-3","title":"Approve edit: ?","kind":"edit","status":"pending"}`,
+			options:  hermesEditApprovalOptions,
+			wantID:   "deny",
 		},
 	}
 	for _, tc := range cases {
@@ -136,7 +154,7 @@ func TestHermesGuardedPermissionReplies(t *testing.T) {
 				cfg:              Config{Logger: slog.Default()},
 				stdin:            w,
 				pending:          make(map[int]*pendingRPC),
-				selectPermission: hermesPermissionSelector(true, false, slog.Default()),
+				selectPermission: hermesPermissionSelector(true, false, workdir, slog.Default()),
 			}
 			c.handleLine(`{"jsonrpc":"2.0","id":42,"method":"session/request_permission","params":{"sessionId":"ses_1","toolCall":` + tc.toolCall + `,"options":` + tc.options + `}}`)
 

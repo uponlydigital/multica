@@ -579,7 +579,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// human, so those prompts fail closed. Scoped to the built-in
 		// runtime like toolStartCarriesFinalInput: jcode shares this
 		// backend but has its own permission semantics.
-		selectPermission: hermesPermissionSelector(b.cfg.BuiltinRuntime, yolo, b.cfg.Logger),
+		selectPermission: hermesPermissionSelector(b.cfg.BuiltinRuntime, yolo, opts.Cwd, b.cfg.Logger),
 		acceptNotification: func(string) bool {
 			return streamingCurrentTurn.Load()
 		},
@@ -1671,14 +1671,15 @@ const acpToolKindEdit = "edit"
 // dangerous. Nobody is present to approve it, so the daemon denies it — the
 // same fail-closed behaviour Hermes has in its own unattended modes:
 //
-//   - kind "edit" (Hermes' per-write edit approval): unchanged, a single-use
-//     grant via selectACPPermissionOption. Hermes Kanban workers write files
-//     without prompts, so denying these would make every task unusable without
-//     adding safety;
+//   - kind "edit" (Hermes' per-write edit approval): a single-use grant via
+//     selectACPPermissionOption, but ONLY when every file the edit touches
+//     resolves (symlinks and ".." followed) inside the task workdir. An edit
+//     outside the workdir, one whose target paths cannot be determined, or any
+//     edit when the workdir is unknown is denied (LAB-152);
 //   - every other kind, including "execute" and a missing or unknown kind:
 //     select the offered reject_once, or return ok=false (a protocol error,
 //     which Hermes maps to deny) when none is offered. Never a grant.
-func hermesPermissionSelector(builtinRuntime, yolo bool, logger *slog.Logger) func(json.RawMessage) (string, bool, bool) {
+func hermesPermissionSelector(builtinRuntime, yolo bool, workdir string, logger *slog.Logger) func(json.RawMessage) (string, bool, bool) {
 	if !builtinRuntime || yolo {
 		return nil
 	}
@@ -1696,19 +1697,181 @@ func hermesPermissionSelector(builtinRuntime, yolo bool, logger *slog.Logger) fu
 			}
 		}
 		if strings.EqualFold(strings.TrimSpace(p.ToolCall.Kind), acpToolKindEdit) {
-			return selectACPPermissionOption(params)
+			paths := hermesEditTargetPaths(params)
+			outside := hermesEditPathsOutside(workdir, paths)
+			if len(paths) > 0 && len(outside) == 0 {
+				if logger != nil {
+					logger.Info("hermes: granted edit inside task workdir", "paths", paths)
+				}
+				return selectACPPermissionOption(params)
+			}
+			if logger != nil {
+				logger.Warn("hermes: denied edit outside task workdir (yolo mode off for this agent)",
+					"title", p.ToolCall.Title, "paths", paths, "outside", outside, "workdir", workdir)
+			}
+			return hermesRejectOnce(p.Options)
 		}
 		if logger != nil {
 			logger.Warn("hermes: denied permission request (yolo mode off for this agent)",
 				"tool_kind", p.ToolCall.Kind, "title", p.ToolCall.Title)
 		}
-		for _, opt := range p.Options {
-			if opt.OptionID != "" && strings.EqualFold(strings.TrimSpace(opt.Kind), acpKindRejectOnce) {
-				return opt.OptionID, false, true
-			}
-		}
-		return "", false, false
+		return hermesRejectOnce(p.Options)
 	}
+}
+
+// hermesRejectOnce selects the offered single-use reject, or reports ok=false
+// (protocol error, which Hermes maps to deny) when none is offered.
+func hermesRejectOnce(options []acpPermissionOption) (string, bool, bool) {
+	for _, opt := range options {
+		if opt.OptionID != "" && strings.EqualFold(strings.TrimSpace(opt.Kind), acpKindRejectOnce) {
+			return opt.OptionID, false, true
+		}
+	}
+	return "", false, false
+}
+
+// hermesV4AFileRe / hermesV4AMoveRe mirror acp_adapter/edit_approval.py, so a
+// multi-file V4A patch is checked per real target, not per display string.
+var (
+	hermesV4AFileRe = regexp.MustCompile(`(?m)^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$`)
+	hermesV4AMoveRe = regexp.MustCompile(`(?m)^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$`)
+)
+
+// hermesEditTargetPaths returns every file path a Hermes edit approval
+// request names: the diff content paths, rawInput.arguments.path, and for a
+// V4A patch every Update/Add/Delete/Move target in the patch body. Hermes
+// builds these from the same arguments the write will use
+// (acp_adapter/edit_approval.py build_acp_edit_tool_call). For a multi-file
+// V4A patch the diff path is a comma-joined display string, so it is skipped
+// in favour of the per-file list.
+func hermesEditTargetPaths(params json.RawMessage) []string {
+	var p struct {
+		ToolCall struct {
+			Content []struct {
+				Type string `json:"type"`
+				Path string `json:"path"`
+			} `json:"content"`
+			RawInput struct {
+				Tool      string `json:"tool"`
+				Arguments struct {
+					Path  string `json:"path"`
+					Mode  string `json:"mode"`
+					Patch string `json:"patch"`
+				} `json:"arguments"`
+			} `json:"rawInput"`
+		} `json:"toolCall"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	args := p.ToolCall.RawInput.Arguments
+	v4a := args.Patch != "" && (args.Mode == "patch" || p.ToolCall.RawInput.Tool == "patch" && args.Path == "")
+	if v4a {
+		for _, m := range hermesV4AFileRe.FindAllStringSubmatch(args.Patch, -1) {
+			add(m[1])
+		}
+		for _, m := range hermesV4AMoveRe.FindAllStringSubmatch(args.Patch, -1) {
+			add(m[1])
+			add(m[2])
+		}
+	}
+	add(args.Path)
+	for _, c := range p.ToolCall.Content {
+		if c.Type != "diff" {
+			continue
+		}
+		if v4a && strings.Contains(c.Path, ", ") {
+			continue // comma-joined display string; targets came from the patch body
+		}
+		add(c.Path)
+	}
+	return out
+}
+
+// hermesEditPathsOutside returns the paths that do not resolve inside workdir.
+// With no workdir, every path counts as outside (fail closed).
+func hermesEditPathsOutside(workdir string, paths []string) []string {
+	var outside []string
+	root := ""
+	if strings.TrimSpace(workdir) != "" && filepath.IsAbs(workdir) {
+		if r, err := filepath.EvalSymlinks(workdir); err == nil {
+			root = r
+		}
+	}
+	for _, path := range paths {
+		if root == "" || !hermesPathInside(root, workdir, path) {
+			outside = append(outside, path)
+		}
+	}
+	return outside
+}
+
+// hermesPathInside reports whether target, as Hermes would resolve it (a
+// leading "~" is the user's home, a relative path is relative to the task
+// workdir), lands inside root (the symlink-resolved workdir). Every existing
+// component is resolved with EvalSymlinks, so a symlink inside the workdir
+// that points outside is caught; ".." after a missing component is purely
+// lexical, which is exact because a missing component cannot be a symlink.
+// Any error fails closed (returns false).
+func hermesPathInside(root, workdir, target string) bool {
+	if target == "" || strings.ContainsRune(target, 0) {
+		return false
+	}
+	if target == "~" || strings.HasPrefix(target, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return false
+		}
+		target = home + target[1:]
+	} else if strings.HasPrefix(target, "~") {
+		return false // ~otheruser
+	}
+	if !filepath.IsAbs(target) {
+		target = workdir + string(filepath.Separator) + target
+	}
+	cur := string(filepath.Separator)
+	missing := false
+	for _, comp := range strings.Split(filepath.ToSlash(target), "/") {
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, comp)
+		if missing {
+			cur = next
+			continue
+		}
+		if _, err := os.Lstat(next); err != nil {
+			if !os.IsNotExist(err) {
+				return false
+			}
+			missing = true
+			cur = next
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(next)
+		if err != nil {
+			return false
+		}
+		cur = resolved
+	}
+	return cur == root || strings.HasPrefix(cur, root+string(filepath.Separator))
 }
 
 // acpRPCError is a JSON-RPC error frame returned by the agent process.
