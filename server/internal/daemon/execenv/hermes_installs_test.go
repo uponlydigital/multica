@@ -3,6 +3,7 @@ package execenv
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -180,5 +181,71 @@ func TestHermesOverlayEnvStripsYolo(t *testing.T) {
 	}
 	if env["ANTHROPIC_API_KEY"] != "sk-source" {
 		t.Errorf("other source settings must survive, got %q", env["ANTHROPIC_API_KEY"])
+	}
+}
+
+// python-dotenv also reads a quoted key ('HERMES_YOLO_MODE'=1), so the strip
+// must recognise it too or yolo comes back on for every agent of the profile.
+func TestHermesOverlayEnvStripsQuotedYoloKey(t *testing.T) {
+	t.Parallel()
+	for _, line := range []string{
+		"'HERMES_YOLO_MODE'=1",
+		`"HERMES_YOLO_MODE"=1`,
+		"export 'HERMES_YOLO_MODE'=true",
+		"  'HERMES_YOLO_MODE' = 1",
+	} {
+		sourceHome := t.TempDir()
+		mustWrite(t, filepath.Join(sourceHome, ".env"), "ANTHROPIC_API_KEY=sk-source\n"+line+"\n")
+		hermesHome := filepath.Join(t.TempDir(), "hermes-home")
+		skills := []SkillContextForEnv{{Name: "Review Helper", Content: "x"}}
+		if _, err := prepareHermesHome(hermesHome, sourceHome, false, skills, nil, "", "", testLogger()); err != nil {
+			t.Fatal(err)
+		}
+		body, err := os.ReadFile(filepath.Join(hermesHome, ".env"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), "HERMES_YOLO_MODE") {
+			t.Errorf("%q: yolo line survived in the overlay .env:\n%s", line, body)
+		}
+		if !strings.Contains(string(body), "ANTHROPIC_API_KEY=sk-source") {
+			t.Errorf("%q: other settings must survive:\n%s", line, body)
+		}
+	}
+	if got := dotenvLineKey("'A'=1"); got != "A" {
+		t.Errorf("dotenvLineKey quoted = %q, want A", got)
+	}
+	if got := dotenvLineKey("'A=1"); got != "'A" {
+		t.Errorf("dotenvLineKey unbalanced quote = %q, want 'A", got)
+	}
+}
+
+// If the store for the current source home cannot be created, a link left by
+// an earlier run (here: another profile's store) must not stay in place, or
+// the task would quietly build into the wrong profile's environment.
+func TestHermesInstallsStoreFailureRemovesStaleLink(t *testing.T) {
+	t.Parallel()
+	profile := t.TempDir()
+	home := filepath.Join(t.TempDir(), "hermes-home")
+	skills := []SkillContextForEnv{{Name: "Review Helper", Content: "x"}}
+	if _, err := prepareHermesHome(home, profile, false, skills, nil, "", "", testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	otherStore := filepath.Join(t.TempDir(), "hermes-installs", "other-profile")
+	if err := mountHermesInstalls(home, profile, otherStore, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got := readLinkTarget(t, filepath.Join(home, "installs")); got != otherStore {
+		t.Fatalf("setup: installs -> %q, want %q", got, otherStore)
+	}
+	// A regular file where the store's parent dir should be: MkdirAll fails.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	mustWrite(t, blocker, "x")
+	badStore := filepath.Join(blocker, "this-profile")
+	if err := mountHermesInstalls(home, profile, badStore, testLogger()); err == nil {
+		t.Fatal("want the store creation error to be reported")
+	}
+	if _, err := os.Lstat(filepath.Join(home, "installs")); !os.IsNotExist(err) {
+		t.Fatalf("stale installs link must be removed on store failure, lstat err=%v", err)
 	}
 }

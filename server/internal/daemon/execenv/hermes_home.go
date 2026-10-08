@@ -502,7 +502,13 @@ func dotenvLineKey(line string) string {
 	if eq <= 0 {
 		return ""
 	}
-	return strings.TrimSpace(s[:eq])
+	key := strings.TrimSpace(s[:eq])
+	// python-dotenv (what Hermes loads .env with) also accepts a quoted key:
+	// 'KEY'=v or "KEY"=v assigns KEY.
+	if len(key) >= 2 && (key[0] == '\'' || key[0] == '"') && key[len(key)-1] == key[0] {
+		key = strings.TrimSpace(key[1 : len(key)-1])
+	}
+	return key
 }
 
 // mirrorSharedHermesHome symlinks every top-level entry of the shared ~/.hermes/

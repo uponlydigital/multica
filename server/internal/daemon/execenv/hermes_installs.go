@@ -83,13 +83,18 @@ func mountHermesInstalls(hermesHome, sourceHome, store string, logger *slog.Logg
 	}
 
 	target := ""
+	var storeErr error
 	if fi, err := os.Stat(filepath.Join(shared, hermesInstallsEntry)); err == nil && fi.IsDir() {
 		target = filepath.Join(shared, hermesInstallsEntry)
 	} else if store != "" {
 		if err := os.MkdirAll(store, 0o700); err != nil {
-			return fmt.Errorf("create hermes installs store %s: %w", store, err)
+			// Fall through to the no-target path so a link left by an earlier
+			// run (possibly to another source home's store) is removed before
+			// the error is reported; otherwise the task would keep using it.
+			storeErr = fmt.Errorf("create hermes installs store %s: %w", store, err)
+		} else {
+			target = store
 		}
-		target = store
 	}
 
 	if target == "" {
@@ -98,7 +103,7 @@ func mountHermesInstalls(hermesHome, sourceHome, store string, logger *slog.Logg
 				return fmt.Errorf("remove stale installs link: %w", err)
 			}
 		}
-		return nil
+		return storeErr
 	}
 	if err := linkSharedHermesEntry(target, dst); err != nil {
 		return fmt.Errorf("link installs: %w", err)

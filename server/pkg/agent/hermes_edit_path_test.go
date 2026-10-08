@@ -64,11 +64,7 @@ func TestHermesEditPathPolicy(t *testing.T) {
 	outsideFile := filepath.Join(outsideDir, "b.txt")
 
 	sel := hermesPermissionSelector(true, false, workdir, nil)
-	cases := []struct {
-		name   string
-		params json.RawMessage
-		grant  bool
-	}{
+	cases := []hermesEditCase{
 		{"relative file in workdir", hermesWriteFileEdit(t, "notes.md"), true},
 		{"nested new dirs in workdir", hermesWriteFileEdit(t, "a/b/c.txt"), true},
 		{"absolute path in workdir", hermesWriteFileEdit(t, filepath.Join(workdir, "sub", "f.txt")), true},
@@ -93,6 +89,72 @@ func TestHermesEditPathPolicy(t *testing.T) {
 		{"V4A move to outside", hermesV4AEdit(t, "a.txt",
 			"*** Begin Patch\n*** Move File: a.txt -> ../../canary/a.txt\n*** End Patch"), false},
 	}
+	runHermesEditCases(t, sel, cases)
+}
+
+// Review of PR #2 (LAB-152 round 2): bypasses found by the independent review.
+func TestHermesEditPathPolicyReviewBypasses(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	workdir := filepath.Join(base, "task", "workdir")
+	outsideDir := filepath.Join(base, "canary")
+	for _, d := range []string{workdir, outsideDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(workdir, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outsideDir, "target.txt")
+	if err := os.WriteFile(outsideFile, []byte("canary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// "note " (trailing space) is a symlink to a file outside; "note" does
+	// not exist. And "plain" is a symlink outside, requested as "plain ".
+	if err := os.Symlink(outsideFile, filepath.Join(workdir, "note ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(workdir, "plain")); err != nil {
+		t.Fatal(err)
+	}
+	abs := func(rel string) string { return workdir + "/" + rel }
+
+	sel := hermesPermissionSelector(true, false, workdir, nil)
+	cases := []hermesEditCase{
+		// 1. Hermes' executor accepts "***Add File:" with no space after ***.
+		{"V4A no-space Add header outside", hermesV4AEdit(t, "a.txt",
+			"*** Begin Patch\n*** Update File: a.txt\n@@\n-x\n+y\n***Add File: "+filepath.Join(outsideDir, "x")+"\n+z\n*** End Patch"), false},
+		{"V4A no-space Move header outside", hermesV4AEdit(t, "a.txt",
+			"*** Begin Patch\n***Move File: a.txt -> "+filepath.Join(outsideDir, "a.txt")+"\n*** End Patch"), false},
+		{"V4A NBSP after *** outside", hermesV4AEdit(t, "a.txt",
+			"*** Begin Patch\n***\u00a0Add File: "+filepath.Join(outsideDir, "x")+"\n+z\n*** End Patch"), false},
+		{"V4A unknown *** line", hermesV4AEdit(t, "a.txt",
+			"*** Begin Patch\n*** Update File: a.txt\n@@\n-x\n+y\n*** Copy File: a.txt\n*** End Patch"), false},
+		{"V4A CRLF, all inside", hermesV4AEdit(t, "a.txt",
+			"*** Begin Patch\r\n***Update File: a.txt\r\n@@\r\n-x\r\n+y\r\n*** End Patch\r\n"), true},
+		// 2. ".." out of a missing dir must not hide a later symlink.
+		{"missing/../symlink escape (absolute)", hermesWriteFileEdit(t, abs("missing/../escape/new.txt")), false},
+		{"missing/../symlink escape (relative)", hermesWriteFileEdit(t, "missing/../escape/new.txt"), false},
+		{"missing/../ back inside", hermesWriteFileEdit(t, "missing/../new.txt"), true},
+		// 4. Paths are not trimmed into a different file.
+		{"trailing-space symlink outside", hermesWriteFileEdit(t, abs("note ")), false},
+		{"trailing space on an outside symlink name", hermesWriteFileEdit(t, abs("plain ")), false},
+		{"trailing Python-only whitespace on symlink name", hermesWriteFileEdit(t, abs("plain\x1c")), false},
+		{"whitespace-only path", hermesWriteFileEdit(t, "   "), false},
+		{"tilde is denied", hermesWriteFileEdit(t, "~"), false},
+	}
+	runHermesEditCases(t, sel, cases)
+}
+
+type hermesEditCase struct {
+	name   string
+	params json.RawMessage
+	grant  bool
+}
+
+func runHermesEditCases(t *testing.T, sel func(json.RawMessage) (string, bool, bool), cases []hermesEditCase) {
+	t.Helper()
 	for _, tc := range cases {
 		id, grant, ok := sel(tc.params)
 		if !ok {

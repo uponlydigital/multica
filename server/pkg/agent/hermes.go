@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
@@ -1697,9 +1698,9 @@ func hermesPermissionSelector(builtinRuntime, yolo bool, workdir string, logger 
 			}
 		}
 		if strings.EqualFold(strings.TrimSpace(p.ToolCall.Kind), acpToolKindEdit) {
-			paths := hermesEditTargetPaths(params)
+			paths, readable := hermesEditTargetPaths(params)
 			outside := hermesEditPathsOutside(workdir, paths)
-			if len(paths) > 0 && len(outside) == 0 {
+			if readable && len(paths) > 0 && len(outside) == 0 {
 				if logger != nil {
 					logger.Info("hermes: granted edit inside task workdir", "paths", paths)
 				}
@@ -1707,7 +1708,7 @@ func hermesPermissionSelector(builtinRuntime, yolo bool, workdir string, logger 
 			}
 			if logger != nil {
 				logger.Warn("hermes: denied edit outside task workdir (yolo mode off for this agent)",
-					"title", p.ToolCall.Title, "paths", paths, "outside", outside, "workdir", workdir)
+					"title", p.ToolCall.Title, "paths", paths, "outside", outside, "readable", readable, "workdir", workdir)
 			}
 			return hermesRejectOnce(p.Options)
 		}
@@ -1730,12 +1731,54 @@ func hermesRejectOnce(options []acpPermissionOption) (string, bool, bool) {
 	return "", false, false
 }
 
-// hermesV4AFileRe / hermesV4AMoveRe mirror acp_adapter/edit_approval.py, so a
-// multi-file V4A patch is checked per real target, not per display string.
+// hermesV4AFileRe / hermesV4AMoveRe mirror the operation markers of Hermes'
+// V4A executor (tools/patch_parser.py _OP_MARKERS), not just the approval
+// display parser: `***` may be followed by NO whitespace ("***Add File: x"),
+// and Python's str-mode \s is Unicode whitespace, so hermesPyWS stands in
+// for it. Any other line starting with "***" that is not Begin/End Patch makes
+// the whole patch unreadable to the daemon and the edit is denied, so a
+// marker spelling this list misses fails closed instead of slipping a target
+// past the check.
+const hermesPyWS = `[\s\p{Z}\x{1c}-\x{1f}\x{85}]`
+
 var (
-	hermesV4AFileRe = regexp.MustCompile(`(?m)^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$`)
-	hermesV4AMoveRe = regexp.MustCompile(`(?m)^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$`)
+	hermesV4AFileRe     = regexp.MustCompile(`^\*\*\*` + hermesPyWS + `*(?:Update|Add|Delete)` + hermesPyWS + `+File:` + hermesPyWS + `*(.+)`)
+	hermesV4AMoveRe     = regexp.MustCompile(`^\*\*\*` + hermesPyWS + `*Move` + hermesPyWS + `+File:` + hermesPyWS + `*(.+?)` + hermesPyWS + `*->` + hermesPyWS + `*(.+)`)
+	hermesV4ABeginEndRe = regexp.MustCompile(`^\*\*\*` + hermesPyWS + `*(?:Begin|End)` + hermesPyWS + `+Patch` + hermesPyWS + `*$`)
 )
+
+// hermesV4ATargets returns every file a V4A patch body names, read line by
+// line exactly as Hermes splits it (\n, one trailing \r dropped). ok=false
+// means a "***" line the daemon cannot classify: the caller must deny.
+func hermesV4ATargets(patch string) (targets []string, ok bool) {
+	for _, line := range strings.Split(patch, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if !strings.HasPrefix(line, "***") {
+			continue
+		}
+		if m := hermesV4AMoveRe.FindStringSubmatch(line); m != nil {
+			targets = append(targets, m[1], m[2])
+			continue
+		}
+		if m := hermesV4AFileRe.FindStringSubmatch(line); m != nil {
+			targets = append(targets, m[1])
+			continue
+		}
+		if hermesV4ABeginEndRe.MatchString(line) {
+			continue
+		}
+		return nil, false
+	}
+	return targets, true
+}
+
+// hermesPyStrip is Python's str.strip(): it also removes \x1c-\x1f, which Go's
+// unicode.IsSpace does not.
+func hermesPyStrip(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f)
+	})
+}
 
 // hermesEditTargetPaths returns every file path a Hermes edit approval
 // request names: the diff content paths, rawInput.arguments.path, and for a
@@ -1744,7 +1787,14 @@ var (
 // (acp_adapter/edit_approval.py build_acp_edit_tool_call). For a multi-file
 // V4A patch the diff path is a comma-joined display string, so it is skipped
 // in favour of the per-file list.
-func hermesEditTargetPaths(params json.RawMessage) []string {
+//
+// Paths are kept byte-exact: Hermes passes write_file/patch paths through
+// unchanged, so a trailing space can be part of a real filename (a symlink
+// named "note " is not "note"). Each path is also listed in its trimmed forms
+// (Go and Python whitespace rules), so whichever spelling Hermes ends up
+// using must be inside. ok=false means the request could not be read in full
+// (bad JSON, or a V4A line the daemon cannot classify): deny.
+func hermesEditTargetPaths(params json.RawMessage) (paths []string, ok bool) {
 	var p struct {
 		ToolCall struct {
 			Content []struct {
@@ -1762,30 +1812,34 @@ func hermesEditTargetPaths(params json.RawMessage) []string {
 		} `json:"toolCall"`
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
-		return nil
+		return nil, false
 	}
 	seen := map[string]struct{}{}
 	var out []string
-	add := func(s string) {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return
-		}
-		if _, ok := seen[s]; ok {
+	addOne := func(s string) {
+		if _, dup := seen[s]; dup {
 			return
 		}
 		seen[s] = struct{}{}
 		out = append(out, s)
 	}
+	add := func(s string) {
+		if s == "" {
+			return // field not set
+		}
+		addOne(s)
+		addOne(strings.TrimSpace(s)) // "" here is checked, and fails closed
+		addOne(hermesPyStrip(s))
+	}
 	args := p.ToolCall.RawInput.Arguments
 	v4a := args.Patch != "" && (args.Mode == "patch" || p.ToolCall.RawInput.Tool == "patch" && args.Path == "")
 	if v4a {
-		for _, m := range hermesV4AFileRe.FindAllStringSubmatch(args.Patch, -1) {
-			add(m[1])
+		targets, readable := hermesV4ATargets(args.Patch)
+		if !readable {
+			return nil, false
 		}
-		for _, m := range hermesV4AMoveRe.FindAllStringSubmatch(args.Patch, -1) {
-			add(m[1])
-			add(m[2])
+		for _, t := range targets {
+			add(t)
 		}
 	}
 	add(args.Path)
@@ -1798,7 +1852,7 @@ func hermesEditTargetPaths(params json.RawMessage) []string {
 		}
 		add(c.Path)
 	}
-	return out
+	return out, true
 }
 
 // hermesEditPathsOutside returns the paths that do not resolve inside workdir.
@@ -1819,31 +1873,36 @@ func hermesEditPathsOutside(workdir string, paths []string) []string {
 	return outside
 }
 
-// hermesPathInside reports whether target, as Hermes would resolve it (a
-// leading "~" is the user's home, a relative path is relative to the task
-// workdir), lands inside root (the symlink-resolved workdir). Every existing
-// component is resolved with EvalSymlinks, so a symlink inside the workdir
-// that points outside is caught; ".." after a missing component is purely
-// lexical, which is exact because a missing component cannot be a symlink.
-// Any error fails closed (returns false).
+// hermesPathInside reports whether target lands inside root (the
+// symlink-resolved workdir) the way the kernel would resolve it when Hermes
+// writes. Fail closed (false) on anything the daemon cannot pin down.
+//
+// A relative path is resolved against the task workdir, which is where the
+// Hermes terminal session starts. Known residual: Hermes runs file tools
+// through that session, so after a `cd` elsewhere a relative path lands
+// relative to the new directory, which the daemon cannot see. Denying all
+// relative paths is not an option (every task writes ./report.md), so that
+// case, like a directory swapped for a symlink between this check and the
+// write (TOCTOU), is left to the OS sandbox around the whole Hermes process
+// (ops/multica/deny/WALL.md). This check is defence in depth, not the wall.
+//
+// "~" paths are denied: Hermes expands them with its backend shell's $HOME,
+// not the daemon's, and a home dir is never the task workdir.
+//
+// Every component is checked against the filesystem with Lstat, including
+// components after a missing one: "missing/../escape" comes back to an
+// existing dir, so "escape" must still be resolved (it may be a symlink out).
+// Existing components are resolved with EvalSymlinks and ".." takes the parent
+// of the resolved path, as the kernel does. Any error other than "does not
+// exist" denies.
 func hermesPathInside(root, workdir, target string) bool {
-	if target == "" || strings.ContainsRune(target, 0) {
+	if target == "" || strings.ContainsRune(target, 0) || strings.HasPrefix(target, "~") {
 		return false
-	}
-	if target == "~" || strings.HasPrefix(target, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil || home == "" {
-			return false
-		}
-		target = home + target[1:]
-	} else if strings.HasPrefix(target, "~") {
-		return false // ~otheruser
 	}
 	if !filepath.IsAbs(target) {
 		target = workdir + string(filepath.Separator) + target
 	}
 	cur := string(filepath.Separator)
-	missing := false
 	for _, comp := range strings.Split(filepath.ToSlash(target), "/") {
 		switch comp {
 		case "", ".":
@@ -1853,15 +1912,10 @@ func hermesPathInside(root, workdir, target string) bool {
 			continue
 		}
 		next := filepath.Join(cur, comp)
-		if missing {
-			cur = next
-			continue
-		}
 		if _, err := os.Lstat(next); err != nil {
 			if !os.IsNotExist(err) {
 				return false
 			}
-			missing = true
 			cur = next
 			continue
 		}
