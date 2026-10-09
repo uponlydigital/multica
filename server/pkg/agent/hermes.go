@@ -1638,12 +1638,67 @@ func hermesYoloOptIn(agentEnv map[string]string) bool {
 	return truthy
 }
 
-// hermesChildEnv builds the Hermes child env. With the opt-in it pins
-// HERMES_YOLO_MODE=1 (the pre-opt-in behaviour); without it every
-// HERMES_YOLO_MODE entry — inherited from the daemon or set to a falsy value
-// in custom_env — is removed, so Hermes keeps its approval prompts.
+// hermesInheritedEnvAllowList names the only HERMES_* variables a Hermes task
+// may inherit from the daemon's own process environment. Everything else in
+// the HERMES_ namespace is per-session state of whatever Hermes process started
+// the daemon (HERMES_SINGLE_QUERY_SESSION, HERMES_EXEC_ASK, HERMES_INTERACTIVE,
+// HERMES_KANBAN_*, ...), and inheriting it changes how the task's Hermes
+// behaves: the single-query flag routes dangerous-command approvals around the
+// daemon (an auto-approve with approvals.single_query_mode: approve, bypassing
+// the yolo opt-in), and HERMES_KANBAN_* points the task at another engine's
+// board. It is an allow-list so new Hermes session markers are dropped by
+// default (LAB-151). HERMES_HOME stays: Hermes needs it to find its config when
+// the daemon did not set an overlay home in the task env.
+var hermesInheritedEnvAllowList = map[string]struct{}{
+	"HERMES_HOME": {},
+}
+
+// hermesInheritedSecretEnvKeys are credentials that must never be inherited by
+// an agent process from the daemon host: a 1Password service-account or
+// Connect token opens the vault to every task (LAB-151). OP_SESSION_<account>
+// (1Password CLI sign-in sessions) is matched by prefix below.
+var hermesInheritedSecretEnvKeys = map[string]struct{}{
+	"OP_SERVICE_ACCOUNT_TOKEN": {},
+	"OP_CONNECT_TOKEN":         {},
+}
+
+// hermesInheritedEnvAllowed reports whether an entry of the daemon's own
+// process environment may pass to a Hermes child. It only filters what is
+// inherited: values the daemon assembled for the task (HERMES_HOME overlay)
+// and the agent's own custom_env are added afterwards and always kept.
+func hermesInheritedEnvAllowed(key string) bool {
+	upper := strings.ToUpper(key)
+	if strings.HasPrefix(upper, "HERMES_") {
+		_, ok := hermesInheritedEnvAllowList[upper]
+		return ok && key == upper
+	}
+	if _, secret := hermesInheritedSecretEnvKeys[upper]; secret {
+		return false
+	}
+	return !strings.HasPrefix(upper, "OP_SESSION_")
+}
+
+// hermesChildEnv builds the Hermes child env. The daemon's own environment is
+// filtered first (hermesInheritedEnvAllowed), then the per-task env is layered
+// on top. With the opt-in it pins HERMES_YOLO_MODE=1 (the pre-opt-in
+// behaviour); without it every HERMES_YOLO_MODE entry — inherited from the
+// daemon or set to a falsy value in custom_env — is removed, so Hermes keeps
+// its approval prompts.
 func hermesChildEnv(agentEnv map[string]string, yolo bool) []string {
-	base := buildEnv(agentEnv)
+	inherited := os.Environ()
+	filtered := make([]string, 0, len(inherited))
+	for _, entry := range inherited {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, overridden := agentEnv[key]; overridden {
+			// The task env sets this key; drop the inherited copy so the
+			// child sees exactly one value.
+			continue
+		}
+		if hermesInheritedEnvAllowed(key) {
+			filtered = append(filtered, entry)
+		}
+	}
+	base := mergeEnv(filtered, agentEnv)
 	env := make([]string, 0, len(base)+1)
 	for _, entry := range base {
 		key, _, _ := strings.Cut(entry, "=")
